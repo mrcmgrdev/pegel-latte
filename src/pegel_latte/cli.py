@@ -1,8 +1,15 @@
 """CLI interface for pegel-latte."""
 
+import sys
 from pathlib import Path
 
 import click
+
+# Windows consoles default to cp1252, which can't encode characters that may
+# appear in OCR output or error messages. Force UTF-8 so echo never crashes.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from pegel_latte.reader import read_water_level, read_directory, SUPPORTED_EXTENSIONS
 from pegel_latte.output.json_out import write_json, format_json
@@ -63,10 +70,10 @@ def read(path: str, output_format: str, output_path: str | None, verbose: bool):
     click.echo(f"\nProcessed {len(readings)} image(s), {success_count} successful reading(s).")
 
     for reading in readings:
-        status = "✓" if reading.water_level_cm is not None else "✗"
+        status = "[OK]" if reading.water_level_cm is not None else "[--]"
         level = f"{reading.water_level_cm} cm" if reading.water_level_cm is not None else "N/A"
         conf = f"(conf: {reading.confidence:.1%})" if reading.confidence > 0 else ""
-        error = f" — {reading.error}" if reading.error else ""
+        error = f" - {reading.error}" if reading.error else ""
         click.echo(f"  {status} {reading.source_image.name}: {level} {conf}{error}")
 
     # Output
