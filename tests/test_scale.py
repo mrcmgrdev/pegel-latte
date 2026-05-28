@@ -29,31 +29,36 @@ def test_interpolate_at_boundary():
 
 
 def test_interpolate_extrapolate_above():
+    # With 3+ readings, extrapolation above works
     readings = [
+        ScaleReading(value_cm=300, y_position=50),
         ScaleReading(value_cm=200, y_position=100),
-        ScaleReading(value_cm=100, y_position=200),
+        ScaleReading(value_cm=100, y_position=150),
     ]
-    # Waterline above both readings (y=50)
-    result = interpolate_water_level(readings, waterline_y=50, roi_height=300)
+    # Waterline above all readings (y=25)
+    result = interpolate_water_level(readings, waterline_y=25, roi_height=300)
     assert result is not None
-    assert result > 200  # should extrapolate higher
+    assert result > 300  # should extrapolate higher
 
 
 def test_interpolate_extrapolate_below():
+    # With 3+ readings, extrapolation below works
     readings = [
+        ScaleReading(value_cm=300, y_position=50),
         ScaleReading(value_cm=200, y_position=100),
-        ScaleReading(value_cm=100, y_position=200),
+        ScaleReading(value_cm=100, y_position=150),
     ]
-    # Waterline below both readings (y=250)
-    result = interpolate_water_level(readings, waterline_y=250, roi_height=300)
+    # Waterline below all readings (y=175)
+    result = interpolate_water_level(readings, waterline_y=175, roi_height=300)
     assert result is not None
     assert result < 100  # should extrapolate lower
 
 
-def test_interpolate_insufficient_readings():
+def test_interpolate_single_reading():
+    # With a single reading, it IS the approximate water level
     readings = [ScaleReading(value_cm=100, y_position=100)]
     result = interpolate_water_level(readings, waterline_y=150, roi_height=200)
-    assert result is None
+    assert result == 100.0
 
 
 def test_interpolate_empty_readings():

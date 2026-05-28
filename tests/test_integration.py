@@ -7,7 +7,7 @@ import pytest
 from pegel_latte.reader import read_water_level, read_directory, SUPPORTED_EXTENSIONS
 
 
-DATA_DIR = Path(__file__).parent.parent / "data"
+DATA_DIR = Path(__file__).parent.parent / "data" / "real"
 
 
 @pytest.fixture

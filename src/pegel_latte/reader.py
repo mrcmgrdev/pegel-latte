@@ -7,9 +7,9 @@ import numpy as np
 
 from pegel_latte.detection.gauge import detect_gauge
 from pegel_latte.detection.waterline import detect_waterline
-from pegel_latte.detection.scale import read_scale, interpolate_water_level
+from pegel_latte.detection.scale import read_scale_full_image, interpolate_water_level
 from pegel_latte.metadata import extract_metadata
-from pegel_latte.models import WaterLevelReading
+from pegel_latte.models import WaterLevelReading, GaugeDetection, ScaleReading
 
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
@@ -20,12 +20,11 @@ def read_water_level(image_path: Path, verbose: bool = False) -> WaterLevelReadi
     Process a single image and return the water level reading.
 
     Pipeline:
-    1. Load image
-    2. Extract EXIF metadata (timestamp, GPS)
-    3. Detect gauge region
-    4. Detect waterline
-    5. OCR scale markings
-    6. Interpolate water level
+    1. Load image and extract EXIF metadata
+    2. Run OCR on full image to find numbers
+    3. Cluster numbers vertically to locate the gauge
+    4. Detect waterline in the gauge region
+    5. Interpolate water level from scale readings + waterline
 
     Args:
         image_path: Path to the image file
@@ -42,17 +41,49 @@ def read_water_level(image_path: Path, verbose: bool = False) -> WaterLevelReadi
         reading.error = f"Could not load image: {image_path}"
         return reading
 
+    height, width = image.shape[:2]
+
     # Step 2: Extract metadata
     reading.metadata = extract_metadata(image_path)
 
-    # Step 3: Detect gauge region
-    gauge = detect_gauge(image)
+    # Step 3: Run OCR on full image — this finds numbers AND tells us where the gauge is
+    scale_readings, raw_text, gauge_x = read_scale_full_image(image)
+    reading.scale_readings = scale_readings
+    reading.raw_ocr_text = raw_text
+
+    # Step 4: Determine gauge region
+    if gauge_x is not None and len(scale_readings) >= 2:
+        # Use OCR-detected positions to define gauge region
+        gauge_width = max(int(width * 0.1), 100)
+        roi_x = max(0, gauge_x - gauge_width // 2)
+        roi_w = min(width - roi_x, gauge_width)
+        roi_y = max(0, min(r.y_position for r in scale_readings) - 50)
+
+        # Extend ROI below lowest reading to capture waterline
+        # For multi-meter gauges (large value ranges), extend further
+        max_reading_y = max(r.y_position for r in scale_readings)
+        val_range = max(r.value_cm for r in scale_readings) - min(r.value_cm for r in scale_readings)
+        # Multi-meter: extend by estimated 1 meter band below lowest reading
+        if val_range > 50 and len(scale_readings) >= 3:
+            px_per_cm = (max_reading_y - min(r.y_position for r in scale_readings)) / max(val_range, 1)
+            extend_below = int(px_per_cm * 100)  # 1 full meter band
+        else:
+            extend_below = 300
+        roi_h = min(height - roi_y, max_reading_y - roi_y + extend_below)
+
+        gauge = GaugeDetection(
+            roi_x=roi_x, roi_y=roi_y, roi_width=roi_w, roi_height=roi_h, confidence=0.7
+        )
+    else:
+        # Fallback to CV-based gauge detection
+        gauge = detect_gauge(image)
+
     if gauge is None:
         reading.error = "Could not detect gauge in image"
         return reading
     reading.gauge_detection = gauge
 
-    # Step 4: Extract ROI
+    # Step 5: Extract ROI and detect waterline
     roi = image[
         gauge.roi_y : gauge.roi_y + gauge.roi_height,
         gauge.roi_x : gauge.roi_x + gauge.roi_width,
@@ -62,22 +93,45 @@ def read_water_level(image_path: Path, verbose: bool = False) -> WaterLevelReadi
         reading.error = "Gauge ROI is empty"
         return reading
 
-    # Step 5: Detect waterline in ROI
-    waterline_y = detect_waterline(roi, gauge.roi_y, gauge.roi_height)
+    waterline_y, waterline_conf = detect_waterline(roi, gauge.roi_y, gauge.roi_height)
+
+    # For multi-meter gauges, waterline MUST be well below the lowest reading.
+    # Re-run detection on a sub-ROI below the lowest reading to avoid
+    # picking up meter marker edges or text boundaries.
+    if len(scale_readings) >= 2:
+        val_range = max(r.value_cm for r in scale_readings) - min(r.value_cm for r in scale_readings)
+        lowest_reading_y = max(r.y_position for r in scale_readings) - gauge.roi_y
+
+        if val_range > 50:
+            # Multi-meter gauge: search only below lowest reading
+            # Use dark-valley detection (dirty gauge pattern: bright→dark→bright)
+            sub_roi_start = lowest_reading_y
+            if sub_roi_start < gauge.roi_height - 50:
+                sub_roi = roi[sub_roi_start:, :]
+                wl_sub, conf_sub = detect_waterline(
+                    sub_roi, 0, sub_roi.shape[0], prefer_dark_valley=True
+                )
+                if wl_sub is not None:
+                    waterline_y = wl_sub + sub_roi_start
+                    waterline_conf = conf_sub
+        elif waterline_y is not None and waterline_y < lowest_reading_y:
+            # Single-band: waterline above readings is suspicious
+            waterline_y = lowest_reading_y + int(gauge.roi_height * 0.1)
+            waterline_conf *= 0.3
+
     reading.waterline_y = waterline_y
 
-    # Step 6: OCR scale markings
-    scale_readings, raw_text = read_scale(roi)
-    reading.scale_readings = scale_readings
-    reading.raw_ocr_text = raw_text
-
-    # Step 7: Interpolate water level
+    # Step 6: Interpolate water level
     if waterline_y is not None and len(scale_readings) >= 2:
-        water_level = interpolate_water_level(scale_readings, waterline_y, gauge.roi_height)
+        # Adjust scale reading y-positions to be relative to gauge ROI
+        adjusted_readings = [
+            ScaleReading(value_cm=r.value_cm, y_position=r.y_position - gauge.roi_y)
+            for r in scale_readings
+        ]
+        water_level = interpolate_water_level(adjusted_readings, waterline_y, gauge.roi_height)
         if water_level is not None:
             reading.water_level_cm = round(water_level, 1)
-            # Confidence based on detection quality
-            reading.confidence = _compute_confidence(gauge, scale_readings, waterline_y)
+            reading.confidence = _compute_confidence(gauge, scale_readings, waterline_y, waterline_conf)
     elif waterline_y is not None:
         reading.error = "Could not read enough scale markings for interpolation"
         reading.confidence = 0.2
@@ -102,24 +156,26 @@ def read_directory(directory: Path, verbose: bool = False) -> list[WaterLevelRea
     return readings
 
 
-def _compute_confidence(gauge, scale_readings, waterline_y) -> float:
-    """Compute overall confidence score for a reading."""
-    # Base confidence from gauge detection
-    conf = gauge.confidence
+def _compute_confidence(gauge, scale_readings, waterline_y, waterline_conf: float = 0.5) -> float:
+    """Compute overall confidence score for a reading, incorporating waterline confidence."""
+    conf = float(gauge.confidence) * 0.3  # base from gauge detection
 
-    # Boost if multiple scale readings found
+    # Scale reading quality (up to 0.3)
     if len(scale_readings) >= 3:
-        conf += 0.2
+        conf += 0.3
     elif len(scale_readings) >= 2:
-        conf += 0.1
+        conf += 0.2
 
-    # Check if scale readings are consistent (monotonically increasing/decreasing with y)
+    # Monotonicity bonus (up to 0.1)
     if len(scale_readings) >= 2:
         values = [r.value_cm for r in scale_readings]
         if values == sorted(values) or values == sorted(values, reverse=True):
             conf += 0.1
 
-    return min(conf, 1.0)
+    # Waterline detection confidence (up to 0.3)
+    conf += float(waterline_conf) * 0.3
+
+    return float(min(conf, 1.0))
 
 
 def _save_debug_image(
@@ -150,30 +206,21 @@ def _save_debug_image(
             (gauge.roi_x, y_in_image),
             (gauge.roi_x + gauge.roi_width, y_in_image),
             (255, 0, 0),
-            2,
+            3,
         )
         cv2.putText(
-            debug,
-            "WATERLINE",
-            (gauge.roi_x + gauge.roi_width + 5, y_in_image),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 0, 0),
-            1,
+            debug, "WATERLINE",
+            (gauge.roi_x + gauge.roi_width + 10, y_in_image),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2,
         )
 
     # Draw scale readings
     for sr in scale_readings:
-        y_in_image = gauge.roi_y + sr.y_position
-        cv2.circle(debug, (gauge.roi_x + gauge.roi_width // 2, y_in_image), 4, (0, 0, 255), -1)
+        cv2.circle(debug, (gauge.roi_x + gauge.roi_width // 2, sr.y_position), 6, (0, 0, 255), -1)
         cv2.putText(
-            debug,
-            f"{sr.value_cm}cm",
-            (gauge.roi_x + gauge.roi_width + 5, y_in_image),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
-            (0, 0, 255),
-            1,
+            debug, f"{sr.value_cm}",
+            (gauge.roi_x + gauge.roi_width + 10, sr.y_position),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
         )
 
     # Save debug image
