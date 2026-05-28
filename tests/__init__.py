@@ -1,0 +1,1 @@
+"""Tests for pegel-latte."""
